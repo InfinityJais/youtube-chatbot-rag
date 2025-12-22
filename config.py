@@ -5,14 +5,18 @@ from dotenv import load_dotenv
 # Load environment variables once at the start
 load_dotenv()
 
+out_base = Path("transcript/audio_chunks")
 # --- Configuration ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "youtube-rag-index")
-TEMP_DIR = Path("tmp_video_files")
+TEMP_DIR = Path("transcript/audio_chunks")
 
-if not OPENAI_API_KEY or not PINECONE_API_KEY:
-    raise RuntimeError("API keys not loaded. Check your .env file.")
+if not PINECONE_API_KEY:
+    raise RuntimeError("PINECONE_API_KEY not loaded. Check your .env file")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not loaded. Check your .env file")
 
 # --- Clients ---
 from pinecone import Pinecone

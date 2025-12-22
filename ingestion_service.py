@@ -1,68 +1,73 @@
 import os
 import json
+import traceback
 import shutil
 import subprocess
 import time
 import random
-import traceback
+import logging
+import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Tuple, List, Dict, Union
-import logging
-logger = logging.getLogger(__name__)
+from typing import Tuple, List, Dict, Optional, Union
 
 import yt_dlp
 from dotenv import load_dotenv
 
-# Add these imports at the top of ingestion_service.py
-from config import embeddings, pc, PINECONE_INDEX
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_pinecone import PineconeVectorStore
-from langchain_core.documents import Document
+# --- Configuration Imports ---
+# Wrap in try/except so script doesn't crash if config.py is missing during testing
+try:
+    from config import embeddings, pc, PINECONE_INDEX, out_base
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_pinecone import PineconeVectorStore
+    from langchain_core.documents import Document
+except ImportError:
+    # Placeholder for running standalone
+    pass
 
+# Setup Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+load_dotenv()
 
-# NOTE: load_dotenv is assumed to be run by the main FastAPI app, but kept here for local testing potential
-# load_dotenv() 
-
-# --- OpenAI Client Detection (V3 vs Legacy) ---
-# This block initializes the client and defines the unified wrapper function
+# --- OpenAI Client Setup (Robust V1/Legacy Support) ---
 try:
     from openai import OpenAI
+    # Initialize client once
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     
-    def transcribe_with_whisper(file_path, model="whisper-1", translate=True):
-        """Unified wrapper for OpenAI Whisper API call (New SDK)."""
+    def transcribe_with_whisper(file_path: str, model="whisper-1", translate=True) -> str:
+        """Unified wrapper for OpenAI Whisper API call (New SDK >= 1.0.0)."""
         with open(file_path, "rb") as f:
             if translate:
-                # NEW CLIENT → use translations endpoint
                 resp = openai_client.audio.translations.create(model=model, file=f)
             else:
-                # NEW CLIENT → normal transcription
                 resp = openai_client.audio.transcriptions.create(model=model, file=f)
+            # V1 returns an object, .text is the attribute
             return resp.text
 
-except Exception:
+except ImportError:
     import openai
     openai.api_key = os.getenv("OPENAI_API_KEY")
-    legacy_openai = openai
     
-    def transcribe_with_whisper(file_path, model="whisper-1", translate=True):
-        """Unified wrapper for OpenAI Whisper API call (Legacy SDK)."""
+    def transcribe_with_whisper(file_path: str, model="whisper-1", translate=True) -> str:
+        """Unified wrapper for OpenAI Whisper API call (Legacy SDK < 1.0.0)."""
         with open(file_path, "rb") as f:
             if translate:
-                resp = legacy_openai.Audio.translate(model=model, file=f)
+                resp = openai.Audio.translate(model=model, file=f)
             else:
-                resp = legacy_openai.Audio.transcribe(model=model, file=f)
-        return resp.get("text")
+                resp = openai.Audio.transcribe(model=model, file=f)
+        return resp.get("text", "")
 
 
-# --- I/O Helpers ---
+# --- Core Functions ---
 
-def download_audio(youtube_url: str, out_dir: Path) -> Tuple[Path, Dict[str, Union[str, int]]]:
-    """Downloads audio, converts to 16k mono WAV, and returns path/info."""
+def download_audio(youtube_url: str, out_dir: Path) -> Tuple[Path, Dict]:
+    """Downloads audio using yt-dlp and returns the path to the converted WAV."""
     out_dir.mkdir(parents=True, exist_ok=True)
     
+    # Generate a safe temp filename template
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
@@ -70,221 +75,233 @@ def download_audio(youtube_url: str, out_dir: Path) -> Tuple[Path, Dict[str, Uni
         "noplaylist": True,
     }
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=True)
-        video_id = info.get("id") or info.get("url")
-        # Find the actual downloaded file (yt-dlp may use different extensions)
-        downloaded = next(out_dir.glob(f"{video_id}.*"), None)
-        if downloaded is None:
-            raise FileNotFoundError(f"yt-dlp failed to find the downloaded file for {video_id}.")
-        
-    wav_path = out_dir / f"{video_id}.wav"
-    
-    # FFmpeg conversion to 16k mono s16 (Synchronous)
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(downloaded),
-        "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
-        str(wav_path)
-    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
-    os.remove(downloaded) # Clean up original downloaded file
-    return wav_path, info
+    wav_path = None
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info(f"Fetching info for: {youtube_url}")
+            info = ydl.extract_info(youtube_url, download=True)
+            
+            # FIXED: Don't guess the filename using glob. Ask yt-dlp what it wrote.
+            downloaded_path = Path(ydl.prepare_filename(info))
+            
+            # Handle case where yt-dlp converts format post-download (rare with these opts but possible)
+            if not downloaded_path.exists():
+                # Fallback: look for likely candidates if prepare_filename is slightly off due to post-processing
+                video_id = info.get('id')
+                candidates = list(out_dir.glob(f"{video_id}.*"))
+                if candidates:
+                    downloaded_path = candidates[0]
+                else:
+                    raise FileNotFoundError(f"Could not locate downloaded file for ID: {video_id}")
+
+            video_id = info.get("id")
+            wav_path = out_dir / f"{video_id}.wav"
+            
+            logger.info(f"Converting {downloaded_path.name} to WAV...")
+            
+            # FFmpeg conversion to 16k mono s16
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(downloaded_path),
+                "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
+                str(wav_path)
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            
+            # Optional: Remove original file to save space
+            #if downloaded_path.exists() and downloaded_path != wav_path:
+            #    os.remove(downloaded_path)
+
+            return wav_path, info
+
+    except Exception as e:
+        logger.error(f"Error in download_audio: {e}")
+        raise
 
 def get_duration_seconds(file_path: Path) -> float:
-    """Uses ffprobe to get audio duration."""
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "format=duration:stream=duration", 
-           "-of", "json", str(file_path)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    info = json.loads(proc.stdout)
-    
-    duration = float(info.get("streams", [{}])[0].get("duration", 
-                     info.get("format", {}).get("duration", 0)))
-    
-    if duration <= 0:
-        raise RuntimeError("Could not determine audio duration using ffprobe.")
-    return duration
+    """Uses ffprobe to get audio duration safely."""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a:0", 
+        "-show_entries", "format=duration:stream=duration", 
+        "-of", "json", str(file_path)
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(proc.stdout)
+        
+        # Try stream duration first, then format duration
+        duration_str = None
+        if "streams" in data and data["streams"]:
+            duration_str = data["streams"][0].get("duration")
+        
+        if not duration_str and "format" in data:
+            duration_str = data["format"].get("duration")
+            
+        if duration_str:
+            return float(duration_str)
+        else:
+            raise ValueError("No duration found in ffprobe output")
+            
+    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError) as e:
+        logger.error(f"Failed to get duration for {file_path}: {e}")
+        raise RuntimeError(f"Could not determine audio duration: {e}")
 
-def split_with_ffmpeg_seek(wav_path: Path, out_dir: Path, chunk_length_s=180, overlap_s=2):
+def split_with_ffmpeg_seek(wav_path: Path, out_dir: Path, chunk_length_s=180, overlap_s=2) -> List[Tuple[Path, float, float]]:
     """Splits WAV into chunks using ffmpeg."""
-    out_dir = Path(out_dir)
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    total = get_duration_seconds(wav_path)
+    
+    total_duration = get_duration_seconds(wav_path)
     step = chunk_length_s - overlap_s
     
     if step <= 0:
         raise ValueError("chunk_length_s must be > overlap_s")
 
-    chunks = []
+    chunks_info = []
     start = 0.0
     idx = 0
-    while start < total:
-        end = min(start + chunk_length_s, total)
-        out_file = out_dir / f"chunk_{idx:03d}.wav"
+    
+    logger.info(f"Splitting audio (Total: {total_duration:.2f}s) into chunks...")
+    
+    while start < total_duration:
+        end = min(start + chunk_length_s, total_duration)
+        chunk_filename = f"chunk_{idx:03d}.wav"
+        out_file = out_dir / chunk_filename
+        
+        # We process strictly to avoid drift, using -ss before -i for speed
+        duration = end - start
         
         subprocess.run([
-            "ffmpeg", "-y", "-ss", f"{start}", "-i", str(wav_path), "-t", f"{end - start}",
+            "ffmpeg", "-y", "-ss", f"{start:.2f}", "-i", str(wav_path), 
+            "-t", f"{duration:.2f}",
             "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", str(out_file)
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        chunks.append((out_file, start, end))
+        chunks_info.append((out_file, start, end))
+        
+        if end >= total_duration:
+            break
+            
         idx += 1
         start += step
     
-    return chunks
+    return chunks_info
 
-# Add this helper function for chunking text
-def _chunk_and_enrich(text: str, source_path: Path, metadata: dict = None) -> List[Document]:
-    """Split text into chunks and create Document objects with metadata."""
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-        separators=["\n\n", "\n", " ", ""]
-    )
-    
-    chunks = text_splitter.split_text(text)
-    documents = []
-    
-    for i, chunk in enumerate(chunks):
-        doc_metadata = {
-            "source": str(source_path),
-            "chunk_index": i,
-            "total_chunks": len(chunks),
-            **(metadata or {})
-        }
-        documents.append(Document(page_content=chunk, metadata=doc_metadata))
-    
-    return documents
-
-
-def transcribe_chunk_worker(chunk_info, model="whisper-1", max_retries=3, translate=True):
+def transcribe_chunk_worker(chunk_info: Tuple[Path, float, float], model="whisper-1", max_retries=3, translate=True) -> Dict:
     """Robust worker for transcribing one chunk with retries."""
     chunk_path, start_s, end_s = chunk_info
-    chunk_path = Path(chunk_path)
     attempt = 0
 
     if not chunk_path.exists():
-        return {"start": start_s, "end": end_s, "text": "", "file": str(chunk_path), "error": "Chunk file not found."}
+        return {"start": start_s, "end": end_s, "text": "", "error": "File missing"}
 
     while attempt <= max_retries:
         try:
+            # logger.debug(f"Transcribing chunk {chunk_path.name} (Attempt {attempt+1})")
             text = transcribe_with_whisper(str(chunk_path), model=model, translate=translate)
             return {"start": start_s, "end": end_s, "text": (text or "").strip(), "file": str(chunk_path)}
         except Exception as e:
             attempt += 1
             if attempt > max_retries:
-                errmsg = f"Failed chunk {chunk_path.name} after {max_retries} retries. Last error: {e}"
-                return {"start": start_s, "end": end_s, "text": f"**TRANSCRIPTION ERROR**", "file": str(chunk_path), "error": errmsg}
-            time.sleep((2 ** attempt) + random.random())
-    return {"start": start_s, "end": end_s, "text": f"**TRANSCRIPTION ERROR**"}
+                logger.error(f"Failed chunk {chunk_path.name}: {e}")
+                return {
+                    "start": start_s, "end": end_s, 
+                    "text": "**TRANSCRIPTION ERROR**", 
+                    "error": str(e)
+                }
+            # Exponential backoff
+            time.sleep((1.5 ** attempt) + random.uniform(0.1, 1.0))
+    
+    return {"start": start_s, "end": end_s, "text": "**TRANSCRIPTION ERROR**"}
 
-def stitch_transcripts(results, title, output_folder) -> Path:
+def stitch_transcripts(results: List[Dict], title: str, output_folder: Path) -> Path:
     """Stitches results and saves the final transcript file."""
+    # Sort by start time to ensure order
     results.sort(key=lambda r: r["start"])
-    stitched_lines = [r["text"] for r in results if r["text"] and not r["text"].startswith('**TRANSCRIPTION ERROR**')]
     
-    stitched = "\n".join(stitched_lines)
+    stitched_lines = []
+    for r in results:
+        text = r.get("text", "")
+        if text and not text.startswith('**TRANSCRIPTION ERROR**'):
+            stitched_lines.append(text)
     
-    # Build safe filename
-    safe = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).rstrip()[:200]
-    out_txt = output_folder / f"{safe}_translated.txt"
-    out_txt.parent.mkdir(exist_ok=True)
-    out_txt.write_text(stitched, encoding="utf-8")
+    full_text = "\n".join(stitched_lines)
     
-    return out_txt
+    # Sanitize title for filename
+    safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip()[:100]
+    out_file = output_folder / f"{safe_title}_transcript.txt"
+    
+    output_folder.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(full_text, encoding="utf-8")
+    
+    logger.info(f"Transcript saved to: {out_file}")
+    return out_file
 
+# --- Orchestrator (The Missing Piece) ---
 
-# ----------------------------------------------------------------------
-# THE CORE CALLABLE API FUNCTION
-# ----------------------------------------------------------------------
-
-# Update the main function signature and logic
-def run_transcription_pipeline_core(
-    youtube_url: str, 
-    pinecone_index_name: str,  # Changed from output_folder
-    output_base_dir: Path = Path("transcripts")  # Add default
-) -> dict:
+def transcribe_video_pipeline(youtube_url: str, working_dir="./temp_workspace") -> Optional[Path]:
     """
-    Complete pipeline: Download → Transcribe → Store in Pinecone → Save file.
-    Returns: Dictionary with results
+    Main pipeline function: Download -> Split -> Transcribe (Parallel) -> Stitch
     """
-    import tempfile
-    from pathlib import Path
-    
-    # Create temp directory
-    temp_dir = Path(tempfile.mkdtemp(prefix="transcribe_"))
-    CHUNKS_DIR = temp_dir / "chunks"
+    session_id = str(uuid.uuid4())[:8]
+    work_path = Path(working_dir) / session_id
+    raw_audio_dir = work_path / "raw"
+    chunks_dir = work_path / "chunks"
     
     try:
-        # 1. Download and transcribe
-        logger.info(f"[TRANSCRIPTION] Starting for: {youtube_url}")
-        wav_path, info = download_audio(youtube_url, temp_dir)
+        # 1. Download
+        wav_path, info = download_audio(youtube_url, raw_audio_dir)
+        video_title = info.get("title", "Unknown Video")
         
-        # 2. Split audio
-        chunks = split_with_ffmpeg_seek(wav_path, CHUNKS_DIR)
+        # 2. Split
+        # 10 minute chunks usually work well for Whisper API limits (25MB)
+        chunks = split_with_ffmpeg_seek(wav_path, chunks_dir, chunk_length_s=300, overlap_s=5)
         
-        # 3. Transcribe in parallel
+        # 3. Parallel Transcription
         results = []
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            futures = [ex.submit(transcribe_chunk_worker, c) for c in chunks]
-            for fut in as_completed(futures):
-                results.append(fut.result())
+        max_workers = min(len(chunks), 10) # Don't exceed rate limits excessively
         
-        # 4. Stitch full transcript
-        results.sort(key=lambda r: r["start"])
-        full_text = " ".join([r["text"] for r in results if r.get("text")])
+        logger.info(f"Starting parallel transcription with {max_workers} threads...")
         
-        video_id = info.get("id", "unknown")
-        video_title = info.get("title") or "YouTube Video"
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Map futures to chunks
+            future_to_chunk = {
+                executor.submit(transcribe_chunk_worker, chunk): chunk 
+                for chunk in chunks
+            }
+            
+            for future in as_completed(future_to_chunk):
+                try:
+                    data = future.result()
+                    results.append(data)
+                except Exception as exc:
+                    logger.error(f"Chunk processing generated an exception: {exc}")
+
+        # 4. Stitch
+        final_transcript_path = stitch_transcripts(results, video_title, Path("./transcripts"))
         
-        # 5. Create and store embeddings in Pinecone
-        metadata = {
-            "video_id": video_id,
-            "video_title": video_title,
-            "source_url": youtube_url,
-            "processed_at": time.time()
-        }
-        
-        documents = _chunk_and_enrich(full_text, Path(f"youtube:{video_id}"), metadata)
-        
-        # Store in Pinecone
-        PineconeVectorStore.from_documents(
-            documents=documents,
-            embedding=embeddings,
-            index_name=pinecone_index_name
-        )
-        
-        logger.info(f"[TRANSCRIPTION] Stored {len(documents)} chunks in Pinecone index '{pinecone_index_name}'")
-        
-        # 6. Save transcript file (optional)
-        safe_title = "".join(c for c in video_title if c.isalnum() or c in (" ", "_", "-")).rstrip()[:200]
-        transcript_path = output_base_dir / f"{safe_title}_translated.txt"
-        transcript_path.parent.mkdir(exist_ok=True)
-        transcript_path.write_text(full_text, encoding="utf-8")
-        
-        return {
-            "success": True,
-            "video_id": video_id,
-            "video_title": video_title,
-            "chunks_indexed": len(documents),
-            "transcript_path": str(transcript_path),
-            "pinecone_index": pinecone_index_name
-        }
-        
+        return final_transcript_path
+
     except Exception as e:
-        logger.error(f"[TRANSCRIPTION] FAILED: {e}")
-        traceback.print_exc()
-        return {
-            "success": False,
-            "error": str(e),
-            "video_url": youtube_url
-        }
+        logger.error(f"Pipeline failed: {e}")
+        logger.error(traceback.format_exc())
+        return None
         
     finally:
-        # Cleanup
-        import shutil
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        # cleanup temp files
+        if work_path.exists():
+            logger.info(f"Cleaning up workspace: {work_path}")
+            shutil.rmtree(work_path)
+
+# --- Entry Point ---
+
+if __name__ == "__main__":
+    # Example Usage
+    test_url = "https://www.youtube.com/watch?v=vkhjO7fc78g" 
+    
+    # Ensure you set your API Key in .env or environment
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.warning("OPENAI_API_KEY not found in environment variables!")
+    
+    print(f"Processing: {test_url}")
+    result_file = transcribe_video_pipeline(test_url)
+    if result_file:
+        print(f"Success! Saved at: {result_file}")

@@ -1,23 +1,24 @@
-# main_api.py
-
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-import sys
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pathlib import Path
-from config import PINECONE_INDEX, pc
-from rag_core import get_rag_chain
-from ingestion_service import run_transcription_pipeline_core
-from typing import Optional, List
 import logging
 import shutil
-from typing import Any, Dict
 import time
+from pathlib import Path
+from typing import Optional, Dict, Any
 
-logging.basicConfig(level=logging.INFO)
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# --- LOCAL MODULE IMPORTS ---
+# Ensure these filenames match exactly what you saved earlier!
+from config import PINECONE_INDEX, pc
+from ingestion_service import transcribe_video_pipeline
+from rag import get_rag_chain, ingest_chunks_to_pinecone, ensure_index_exists
+
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- PYDANTIC MODELS ---
 class IngestRequest(BaseModel):
     url: str
 
@@ -27,205 +28,167 @@ class QueryRequest(BaseModel):
 class DeleteRequest(BaseModel):
     delete_index: bool = True
     delete_transcripts: bool = True
+    delete_temp_workspace: bool = True
+    index_name: Optional[str] = None  # Added this field so request.index_name works
 
-
+# --- APP SETUP ---
 app = FastAPI(
     title="YouTube Transcript RAG API",
     description="RAG system for YouTube video Q&A",
-    version="1.0.0",
-    docs_url="/docs",  # Swagger UI at http://127.0.0.1:8000/docs
-    redoc_url="/redoc"  # ReDoc at http://127.0.0.1:8000/redoc
+    version="1.0.0"
 )
-
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Root endpoint
+# --- BACKGROUND TASK WRAPPER (The Glue) ---
+def background_ingestion_task(youtube_url: str, index_name: str):
+    """
+    Orchestrates the full pipeline: 
+    1. Download & Transcribe (ingestion_service.py)
+    2. Chunk & Upload to Pinecone (rag.py)
+    """
+    logger.info(f"🚀 Starting background pipeline for: {youtube_url}")
+    
+    try:
+        # Step 1: Transcribe Video
+        transcript_path = transcribe_video_pipeline(youtube_url, working_dir="./temp_workspace")
+        
+        if not transcript_path:
+            logger.error("❌ Transcription failed. Stopping pipeline.")
+            return
+
+        # Step 2: Ingest into Pinecone
+        # Ensure index exists before pushing data
+        ensure_index_exists(index_name)
+        ingest_chunks_to_pinecone(transcript_path, index_name)
+        
+        logger.info(f"✅ Pipeline complete for: {youtube_url}")
+
+    except Exception as e:
+        logger.error(f"💥 Critical error in background task: {e}")
+
+# --- ENDPOINTS ---
+
 @app.get("/")
 async def root():
     return {
-        "message": "YouTube Transcript RAG API",
-        "status": "running",
+        "status": "online",
         "docs": "http://127.0.0.1:8000/docs",
-        "endpoints": {
-            "health": "/health",
-            "ingest": "/api/ingest",
-            "query": "/api/query",
-            "search": "/api/search"
-        }
+        "endpoints": ["/ingest-video", "/query", "/cleanup"]
     }
 
-# Health check endpoint
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "youtube-rag-api"}
+    return {"status": "healthy"}
 
-# Test endpoint
-@app.get("/api/test")
-async def test_endpoint():
-    return {"message": "API is working!"}
-
-# ----------------------------------------------------------------------
-# 1. INGESTION ENDPOINT (Background Task)
-# ----------------------------------------------------------------------
 @app.post("/ingest-video", status_code=202)
 async def start_ingestion_endpoint(request: IngestRequest, background_tasks: BackgroundTasks):
     """
     Triggers the long-running video ingestion process using BackgroundTasks.
     """
-    url = request.url
-    
+    # Validate basic YouTube URL format
+    if "youtube.com" not in request.url and "youtu.be" not in request.url:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL provided.")
+
     background_tasks.add_task(
-    run_transcription_pipeline_core, 
-    youtube_url=url, 
-    pinecone_index_name=PINECONE_INDEX, 
-    output_base_dir=Path("transcripts")   
+        background_ingestion_task, 
+        youtube_url=request.url, 
+        index_name=PINECONE_INDEX
     )
     
-    logger.info(f"Ingestion started for URL: {url}")  
-
     return {
         "status": "Processing started",
-        "message": f"Ingestion for {url} has begun in the background. Check server logs for status."
+        "message": f"Ingestion for {request.url} has begun. Check server logs for progress."
     }
 
-# ----------------------------------------------------------------------
-# 2. QUERY ENDPOINT (Short Task)
-# ----------------------------------------------------------------------
 @app.post("/query")
 async def ask_query_endpoint(request: QueryRequest):
     """
     Answers a query using the RAG chain.
     """
     try:
-        # Check if the index is ready (optional, but good practice)
-        if PINECONE_INDEX not in pc.list_indexes().names():
+        # Check connectivity
+        available_indexes = [i.name for i in pc.list_indexes()]
+        if PINECONE_INDEX not in available_indexes:
              raise HTTPException(
                 status_code=404, 
-                detail=f"Vector Index '{PINECONE_INDEX}' not found. Please wait for ingestion to complete."
+                detail=f"Index '{PINECONE_INDEX}' not found. Did you ingest any videos yet?"
             )
 
-        # Initialize and invoke the LCEL RAG chain
+        # Initialize Chain
         rag_chain = get_rag_chain(PINECONE_INDEX)
+        
+        # Invoke Chain
         answer = rag_chain.invoke(request.query)
         
         return {
             "query": request.query,
             "answer": answer
         }
-    except HTTPException as e:
-        raise e
+
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print(f"RAG QUERY ERROR: {e}")
-        raise HTTPException(
-            status_code=503, 
-            detail="RAG query failed due to internal service error."
-        )
+        logger.error(f"Query failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# Add this to main_api.py after your other endpoints
-
-# ----------------------------------------------------------------------
-# 3. DELETE ENDPOINT (Cleanup/Reset)
-# ----------------------------------------------------------------------
-@app.delete("/cleanup", response_model=Dict[str, Any], summary="Cleans up Pinecone index and local transcripts.")
-
-async def cleanup_system(request: Optional[DeleteRequest] = None):
+@app.delete("/cleanup", response_model=Dict[str, Any])
+async def cleanup_system(request: DeleteRequest = DeleteRequest()):
     """
-    Handles system cleanup operations based on the request parameters.
-    - If `delete_index` is True, it deletes the specified Pinecone index (or default).
-    - If `delete_transcripts` is True, it deletes the local 'transcripts' folder.
+    Cleans up Pinecone index and local transcript files.
     """
     results = {
-        "operation": "system_cleanup",
-        "success": True,
+        "operation": "cleanup",
         "timestamp": time.time(),
         "details": {}
     }
     
-    # Use provided parameters or defaults
-    if request is None:
-        request = DeleteRequest()  # Use defaults (all True)
-    
-    # Determine which index to target, defaulting to the global config
     target_index = request.index_name or PINECONE_INDEX
     
-    logger.info(f"[CLEANUP] Starting cleanup with parameters: {request.model_dump()}")
-    
-    try:
-        # 1. Delete Pinecone Index
-        if request.delete_index:
+    # 1. Delete Pinecone Index
+    if request.delete_index:
+        try:
+            current_indexes = [i.name for i in pc.list_indexes()]
+            if target_index in current_indexes:
+                pc.delete_index(target_index)
+                results["details"]["pinecone"] = "Deleted"
+            else:
+                results["details"]["pinecone"] = "Not Found (Skipped)"
+        except Exception as e:
+            results["details"]["pinecone"] = f"Error: {str(e)}"
+
+    # 2. Delete Transcripts Folder
+    if request.delete_transcripts:
+        transcripts_dir = Path("./transcripts")
+        if transcripts_dir.exists():
             try:
-                index_names = pc.list_indexes().names()
-                if target_index in index_names:
-                    pc.delete_index(target_index)
-                    results["details"]["pinecone_index"] = {
-                        "deleted": target_index,
-                        "status": "success"
-                    }
-                    logger.info(f"[CLEANUP] Deleted Pinecone index: {target_index}")
-                else:
-                    results["details"]["pinecone_index"] = {
-                        "deleted": target_index,
-                        "status": "not_found"
-                    }
-                    logger.info(f"[CLEANUP] Pinecone index not found: {target_index}")
+                shutil.rmtree(transcripts_dir)
+                results["details"]["local_files"] = "Deleted ./transcripts folder"
             except Exception as e:
-                results["details"]["pinecone_index"] = {
-                    "deleted": target_index,
-                    "status": "error",
-                    "error": str(e)
-                }
-                results["success"] = False
-                logger.error(f"[CLEANUP] Failed to delete index {target_index}: {e}")
-        
-        # 2. Delete Transcript Files (and the containing folder)
-        if request.delete_transcripts:
+                results["details"]["local_files"] = f"Error: {str(e)}"
+        else:
+             results["details"]["local_files"] = "Not Found (Skipped)"
+
+    # 2. Delete temp_workspace Folder
+    if request.delete_transcripts:
+        transcripts_dir = Path("./temp_workspace")
+        if transcripts_dir.exists():
             try:
-                # The folder name used in the previous script's default main()
-                transcripts_dir = Path("transcripts") 
-                if transcripts_dir.exists() and transcripts_dir.is_dir():
-                    # Count files before deletion (just the top-level folder count is enough for logs)
-                    file_count = sum(1 for _ in transcripts_dir.rglob("*") if _.is_file())
-                    
-                    # Delete directory and all contents
-                    shutil.rmtree(transcripts_dir)
-                    
-                    results["details"]["transcripts"] = {
-                        "deleted": str(transcripts_dir),
-                        "files_deleted": file_count,
-                        "status": "success"
-                    }
-                    logger.info(f"[CLEANUP] Deleted directory '{transcripts_dir}' containing {file_count} files.")
-                else:
-                    results["details"]["transcripts"] = {
-                        "deleted": str(transcripts_dir),
-                        "status": "not_found"
-                    }
-                    logger.info(f"[CLEANUP] Local transcripts directory not found: {transcripts_dir}")
+                shutil.rmtree(transcripts_dir)
+                results["details"]["local_files"] = "Deleted ./temp_workspace folder"
             except Exception as e:
-                results["details"]["transcripts"] = {
-                    "status": "error",
-                    "error": str(e)
-                }
-                results["success"] = False
-                logger.error(f"[CLEANUP] Failed to delete transcripts: {e}")
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"[CLEANUP] System cleanup failed: {e}")
-        # The HTTPException is outside the specific cleanup logic for Pinecone/transcripts, 
-        # handling severe errors (like Pinecone client initialization failure, etc.)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Cleanup failed: {str(e)}"
-        )
-# --- How to Run ---
-# uvicorn main_api:app --reload
+                results["details"]["local_files"] = f"Error: {str(e)}"
+        else:
+             results["details"]["local_files"] = "Not Found (Skipped)"
+
+    return results
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
