@@ -3,7 +3,6 @@ import logging
 from typing import List, Dict
 from pathlib import Path
 
-# Third-party imports
 from pinecone import ServerlessSpec
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -12,7 +11,7 @@ from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Config imports
+
 try:
     from config import pc, llm, embeddings, PINECONE_INDEX
 except ImportError:
@@ -32,7 +31,7 @@ def ensure_index_exists(index_name: str = PINECONE_INDEX, dimension: int = 1536)
         existing_indexes = [i.name for i in pc.list_indexes()]
 
         if index_name in existing_indexes:
-            logger.info(f"Index '{index_name}' already exists ✅")
+            logger.info(f"Index '{index_name}' already exists")
             return
 
         logger.info(f"Creating index '{index_name}'...")
@@ -43,7 +42,7 @@ def ensure_index_exists(index_name: str = PINECONE_INDEX, dimension: int = 1536)
             metric="cosine",
             spec=spec
         )
-        logger.info(f"Index '{index_name}' created successfully ✅")
+        logger.info(f"Index '{index_name}' created successfully")
         
     except Exception as e:
         logger.error(f"Failed to ensure index exists: {e}")
@@ -63,7 +62,7 @@ def clear_index_data(index_name: str = PINECONE_INDEX, force: bool = False):
 
         index = pc.Index(index_name)
         index.delete(delete_all=True)
-        logger.info(f"All data cleared from index '{index_name}' ✅")
+        logger.info(f"All data cleared from index '{index_name}'")
         
     except Exception as e:
         logger.error(f"Error clearing index: {e}")
@@ -73,7 +72,7 @@ def index_stats(index_name: str = PINECONE_INDEX):
     try:
         existing_indexes = [i.name for i in pc.list_indexes()]
         if index_name not in existing_indexes:
-            logger.error(f"Index '{index_name}' does not exist ❌")
+            logger.error(f"Index '{index_name}' does not exist")
             return
 
         index = pc.Index(index_name)
@@ -89,9 +88,9 @@ def index_stats(index_name: str = PINECONE_INDEX):
         print(f"Namespaces        : {namespaces or 'default'}")
         
         if vector_count == 0:
-            print("Health status     : EMPTY ⚠️")
+            print("Health status     : EMPTY ")
         else:
-            print("Health status     : HEALTHY ✅")
+            print("Health status     : HEALTHY ")
         print("-------------------\n")
 
         return stats
@@ -150,7 +149,7 @@ def ingest_chunks_to_pinecone(transcript_path: Path, index_name: str = PINECONE_
             embeddings, 
             index_name=index_name
         )
-        logger.info(f"Successfully ingested {transcript_path.name} ✅")
+        logger.info(f"Successfully ingested {transcript_path.name} ")
         
     except Exception as e:
         logger.error(f"Failed to ingest {transcript_path.name}: {e}")
