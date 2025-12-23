@@ -3,6 +3,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any
+import re
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,31 +47,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global dictionary to track status: { "video_id": "processing" | "ready" | "failed" }
+ingestion_status = {}
+
+def extract_video_id_server(url: str):
+    """Simple helper to extract ID for status tracking key."""
+    match = re.search(r"(?:v=|\/)([\w-]{11})(?:\?|&|\/|$)", url)
+    return match.group(1) if match else "unknown"
+
 # --- BACKGROUND TASK WRAPPER (The Glue) ---
 def background_ingestion_task(youtube_url: str, index_name: str):
     """
-    Orchestrates the full pipeline: 
-    1. Download & Transcribe (ingestion_service.py)
-    2. Chunk & Upload to Pinecone (rag.py)
+    Orchestrates the full pipeline with status updates.
     """
+    video_id = extract_video_id_server(youtube_url)
+    ingestion_status[video_id] = "processing" # <--- SET STATUS TO PROCESSING
+
     logger.info(f"🚀 Starting background pipeline for: {youtube_url}")
-    
+
     try:
         # Step 1: Transcribe Video
         transcript_path = transcribe_video_pipeline(youtube_url, working_dir="./temp_workspace")
-        
+
         if not transcript_path:
             logger.error("❌ Transcription failed. Stopping pipeline.")
+            ingestion_status[video_id] = "failed"
             return
 
         # Step 2: Ingest into Pinecone
-        # Ensure index exists before pushing data
         ensure_index_exists(index_name)
         ingest_chunks_to_pinecone(transcript_path, index_name)
-        
+
+        ingestion_status[video_id] = "ready" # <--- SET STATUS TO READY
         logger.info(f"✅ Pipeline complete for: {youtube_url}")
 
     except Exception as e:
+        ingestion_status[video_id] = "failed"
         logger.error(f"💥 Critical error in background task: {e}")
 
 # --- ENDPOINTS ---
@@ -86,6 +98,14 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/status/{video_id}")
+async def get_status(video_id: str):
+    """Frontend polls this to check if ingestion is done."""
+    status = ingestion_status.get(video_id, "not_started")
+    return {"status": status}
+
 
 @app.post("/ingest-video", status_code=202)
 async def start_ingestion_endpoint(request: IngestRequest, background_tasks: BackgroundTasks):
