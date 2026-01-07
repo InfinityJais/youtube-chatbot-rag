@@ -40,7 +40,7 @@ The system is built using:
 -   **OpenAI Whisper** – Speech-to-text
 
 **Embeddings & Retrieval**
--   **Embeddings:** `text-embedding-ada-002`   
+-   **Embeddings:** `OpenAI embedding model-text-embedding-3-small`   
 -   **Vector Database:** Pinecone
 
 **Reasoning**
