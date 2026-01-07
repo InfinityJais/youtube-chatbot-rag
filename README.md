@@ -76,7 +76,7 @@ This phase converts raw video data into a structured, searchable format.
 --  Chunk size: **1000 characters**
 --  Overlap: **200 characters** to preserve context
 -   **Embedding Generation**
- --   Each chunk is converted into a vector using `text-embedding-ada-002`
+ --   Each chunk is converted into a vector using `OpenAI embedding model-text-embedding-3-small`
 -   **Vector Storage**
  --  Vectors are stored in **Pinecone**, along with:
   --   Timestamps
